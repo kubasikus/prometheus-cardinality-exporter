@@ -103,6 +103,89 @@ func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.Prome
 	}
 }
 
+// discoverInstances uses Kubernetes service discovery to find Prometheus endpoints
+// matching the configured selector and regex, and populates the cardinalityInfoByInstance map.
+func discoverInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, promAPIAuthValues map[string]string) {
+	// Obtains the cluster config of the cluster we are currently in
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Error obtaining the current cluster config: %v", err.Error())
+	}
+
+	// Creates the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Error creating the clientset from the cluster config: %v", err.Error())
+	}
+
+	// If namespaces are specified as arguments use them, if not use service discovery
+	var namespaceList []string
+	if len(opts.Namespaces) == 0 {
+		// Accesses the API to list all namespaces in the cluster
+		namespaces, _ := clientset.CoreV1().Namespaces().List(context.TODO(), v1.ListOptions{})
+		for _, namespaceObj := range namespaces.Items {
+			namespaceList = append(namespaceList, namespaceObj.ObjectMeta.GetName())
+		}
+	} else {
+		namespaceList = opts.Namespaces
+	}
+
+	for _, namespace := range namespaceList {
+
+		// Accesses the API to list all endpoints and services which match the label selector in the given namespace
+		endpointsList, _ := clientset.CoreV1().Endpoints(namespace).List(context.TODO(), v1.ListOptions{LabelSelector: opts.Selector})
+
+		if err != nil {
+			log.Fatalf("Error obtaining endpoints matching selector (%v) in namespace (%v): %v", namespace, opts.Selector, err.Error())
+		}
+
+		// Iterate over all of the endpoints and add them to the data structure
+		for _, endpoints := range endpointsList.Items { // This loop represents a service
+
+			prometheusInstanceName := endpoints.ObjectMeta.GetName()
+			//If the instance name doesn't start with the chosen prefix, it is ignored
+			if matched, _ := regexp.MatchString(opts.ServiceRegex, prometheusInstanceName); !matched {
+				continue
+			}
+
+			for _, endpointSubset := range endpoints.Subsets { // This loop represents groups of endpoints within a service
+
+				for _, address := range endpointSubset.Addresses { // This loop represents each individual endpoint
+					shardedInstanceName := address.TargetRef.Name // Name of sharded instance e.g. prometheus-kubernetes-0
+					instanceID := namespace + "_" + prometheusInstanceName + "_" + shardedInstanceName
+
+					if _, ok := cardinalityInfoByInstance[instanceID]; !ok {
+						// Add a newly found endpoint to the data structure
+						cardinalityInfoByInstance[instanceID] = &cardinality.PrometheusCardinalityInstance{
+							Namespace:           namespace,
+							InstanceName:        prometheusInstanceName,
+							ShardedInstanceName: shardedInstanceName,
+							InstanceAddress:     "http://" + address.IP + ":9090",
+							TrackedLabels: cardinality.TrackedLabelNames{
+								SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
+								LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
+								MemoryInBytesByLabelNameLabels:    make([]string, 0, opts.StatsLimit),
+								SeriesCountByLabelValuePairLabels: make([]string, 0, opts.StatsLimit),
+							},
+						}
+					} else {
+						// If the endpoint is already known, update it's address
+						cardinalityInfoByInstance[instanceID].InstanceAddress = "http://" + address.IP + ":9090"
+					}
+
+					if authValue, ok := promAPIAuthValues[instanceID]; ok { // Check for Prometheus API credentials for sharded instance
+						cardinalityInfoByInstance[instanceID].AuthValue = authValue
+					} else if authValue, ok := promAPIAuthValues[namespace+"_"+prometheusInstanceName]; ok { // Check for Prometheus API credentials for instance
+						cardinalityInfoByInstance[instanceID].AuthValue = authValue
+					} else if authValue, ok := promAPIAuthValues[namespace]; ok { // Check for Prometheus API credentials for namespace
+						cardinalityInfoByInstance[instanceID].AuthValue = authValue
+					}
+				}
+			}
+		}
+	}
+}
+
 func collectMetrics() {
 
 	// Number of times to retry before fetching the data before giving up.
@@ -128,85 +211,7 @@ func collectMetrics() {
 
 	for {
 		if opts.ServiceDiscovery {
-
-			// Obtains the cluster config of the cluster we are currently in
-			config, err := rest.InClusterConfig()
-			if err != nil {
-				log.Fatalf("Error obtaining the current cluster config: %v", err.Error())
-			}
-
-			// Creates the clientset
-			clientset, err := kubernetes.NewForConfig(config)
-			if err != nil {
-				log.Fatalf("Error creating the clientset from the cluster config: %v", err.Error())
-			}
-
-			// If namespaces are specified as arguments use them, if not use service discovery
-			var namespaceList []string
-			if len(opts.Namespaces) == 0 {
-				// Accesses the API to list all namespaces in the cluster
-				namespaces, _ := clientset.CoreV1().Namespaces().List(context.TODO(), v1.ListOptions{})
-				for _, namespaceObj := range namespaces.Items {
-					namespaceList = append(namespaceList, namespaceObj.GetName())
-				}
-			} else {
-				namespaceList = opts.Namespaces
-			}
-
-			for _, namespace := range namespaceList {
-
-				// Accesses the API to list all endpoints and services which match the label selector in the given namespace
-				endpointsList, _ := clientset.CoreV1().Endpoints(namespace).List(context.TODO(), v1.ListOptions{LabelSelector: opts.Selector})
-
-				if err != nil {
-					log.Fatalf("Error obtaining endpoints matching selector (%v) in namespace (%v): %v", namespace, opts.Selector, err.Error())
-				}
-
-				// Iterate over all of the endpoints and add them to the data structure
-				for _, endpoints := range endpointsList.Items { // This loop represents a service
-
-					prometheusInstanceName := endpoints.GetName()
-					//If the instance name doesn't start with the chosen prefix, it is ignored
-					if matched, _ := regexp.MatchString(opts.ServiceRegex, prometheusInstanceName); !matched {
-						continue
-					}
-
-					for _, endpointSubset := range endpoints.Subsets { // This loop represents groups of endpoints within a service
-
-						for _, address := range endpointSubset.Addresses { // This loop represents each individual endpoint
-							shardedInstanceName := address.TargetRef.Name // Name of sharded instance e.g. prometheus-kubernetes-0
-							instanceID := namespace + "_" + prometheusInstanceName + "_" + shardedInstanceName
-
-							if _, ok := cardinalityInfoByInstance[instanceID]; !ok {
-								// Add a newly found endpoint to the data structure
-								cardinalityInfoByInstance[instanceID] = &cardinality.PrometheusCardinalityInstance{
-									Namespace:           namespace,
-									InstanceName:        prometheusInstanceName,
-									ShardedInstanceName: shardedInstanceName,
-									InstanceAddress:     "http://" + address.IP + ":9090",
-									TrackedLabels: cardinality.TrackedLabelNames{
-										SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
-										LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
-										MemoryInBytesByLabelNameLabels:    make([]string, 0, opts.StatsLimit),
-										SeriesCountByLabelValuePairLabels: make([]string, 0, opts.StatsLimit),
-									},
-								}
-							} else {
-								// If the endpoint is already known, update it's address
-								cardinalityInfoByInstance[instanceID].InstanceAddress = "http://" + address.IP + ":9090"
-							}
-
-							if authValue, ok := promAPIAuthValues[instanceID]; ok { // Check for Prometheus API credentials for sharded instance
-								cardinalityInfoByInstance[instanceID].AuthValue = authValue
-							} else if authValue, ok := promAPIAuthValues[namespace+"_"+prometheusInstanceName]; ok { // Check for Prometheus API credentials for instance
-								cardinalityInfoByInstance[instanceID].AuthValue = authValue
-							} else if authValue, ok := promAPIAuthValues[namespace]; ok { // Check for Prometheus API credentials for namespace
-								cardinalityInfoByInstance[instanceID].AuthValue = authValue
-							}
-						}
-					}
-				}
-			}
+			discoverInstances(cardinalityInfoByInstance, promAPIAuthValues)
 		}
 
 		// Iterates over all prometheus instances and runs cardinality exporter logic
