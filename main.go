@@ -37,6 +37,37 @@ var opts struct {
 	StatsLimit            int      `long:"stats-limit" short:"L" default:"10" help:"Limit the number of items fetched from the TSDB statistics."`
 }
 
+func loadAuthValues(path string) map[string]string {
+	if path == "" {
+		return nil
+	}
+
+	filename, err := filepath.Abs(path)
+	if err != nil {
+		log.Errorf("Failed to obtain the filepath of the Prometheus API authorisation values file provided: %v.", err.Error())
+		return nil
+	}
+
+	fileContents, err := os.ReadFile(filename)
+	if err != nil {
+		log.Errorf("Failed to read Prometheus API authorisation values file provided: %v.", err.Error())
+		return nil
+	}
+
+	var values map[string]string
+	if err := yaml.Unmarshal(fileContents, &values); err != nil {
+		log.Errorf("Failed to read Prometheus API authorisation values file into the appropriate data structure: %v. Check the format of your file!", err.Error())
+		return nil
+	}
+
+	if len(values) == 0 {
+		log.Errorf("Skipping the authorisation component to continue collecting metrics from Prometheus instances that don't require authorisation. This will result in no metrics from secured Prometheus instances.")
+		return nil
+	}
+
+	return values
+}
+
 func collectMetrics() {
 
 	// Number of times to retry before fetching the data before giving up.
@@ -48,33 +79,13 @@ func collectMetrics() {
 	}
 
 	// Map of prometheus instance identifiers to their authorisation credentials, used for accessing the TSDB API
-	var promAPIAuthValues map[string]string
+	promAPIAuthValues := loadAuthValues(opts.PromAPIAuthValuesFile)
 
 	// This is a data structure that allows for the storage of the names prometheus instances and their sharded instances
 	// Sharded instances are specified because a service may have several endpoints
 	// Ignoring this would result in kubernetes selecting only one endpoint per API call, which could lead to inconsistent metric reporting
 	// Each sharded instance also stores it's address (which can change), the latest cardinality info, and the current tracked labels
 	cardinalityInfoByInstance := make(map[string]*cardinality.PrometheusCardinalityInstance)
-
-	if opts.PromAPIAuthValuesFile != "" {
-		filename, err := filepath.Abs(opts.PromAPIAuthValuesFile)
-		if err != nil {
-			log.Errorf("Failed to obtain the filepath of the Prometheus API authorisation values file provided: %v.", err.Error())
-		} else {
-			fileContents, err := os.ReadFile(filename)
-			if err != nil {
-				log.Errorf("Failed to read Prometheus API authorisation values file provided: %v.", err.Error())
-			} else {
-				err = yaml.Unmarshal(fileContents, &promAPIAuthValues)
-				if err != nil {
-					log.Errorf("Failed to read Prometheus API authorisation values file into the appropriate data structure: %v. Check the format of your file!", err.Error())
-				}
-			}
-		}
-		if len(promAPIAuthValues) == 0 {
-			log.Errorf("Skipping the authorisation component to continue collecting metrics from Prometheus instances that don't require authorisation. This will result in no metrics from secured Prometheus instances.")
-		}
-	}
 
 	if !opts.ServiceDiscovery { // Prometheus instances defined by arguments
 
