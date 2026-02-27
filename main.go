@@ -67,6 +67,42 @@ func loadAuthValues(path string) map[string]string {
 	return values
 }
 
+// loadManualInstances parses the manually provided Prometheus URLs (--proms) and populates
+// the cardinalityInfoByInstance map with their instance name, namespace, and auth credentials.
+// In this case the name of the sharded instance is the same as the name of the prometheus instance
+// because it is not possible to distinguish between them based on addresses given as arguments.
+func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, promAPIAuthValues map[string]string) {
+	// Captures the instance name and namespace from URLs like http(s)://<instance>.<namespace>...
+	regexC := regexp.MustCompile(`https?://([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)`)
+
+	for _, prometheusInstanceAddress := range opts.PrometheusInstances {
+
+		matches := regexC.FindStringSubmatch(prometheusInstanceAddress)
+		if matches == nil {
+			log.Fatalf("%v is not a valid prometheus instance address.", prometheusInstanceAddress)
+		}
+		instanceName := matches[1]
+		namespace := matches[2]
+
+		instanceID := namespace + "_" + instanceName
+
+		// Add the prometheus instance to the data structure
+		cardinalityInfoByInstance[instanceID] = &cardinality.PrometheusCardinalityInstance{
+			Namespace:           namespace,
+			InstanceName:        instanceName,
+			ShardedInstanceName: instanceName,
+			InstanceAddress:     prometheusInstanceAddress,
+			AuthValue:           promAPIAuthValues[prometheusInstanceAddress],
+			TrackedLabels: cardinality.TrackedLabelNames{
+				SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
+				LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
+				MemoryInBytesByLabelNameLabels:    make([]string, 0, opts.StatsLimit),
+				SeriesCountByLabelValuePairLabels: make([]string, 0, opts.StatsLimit),
+			},
+		}
+	}
+}
+
 func collectMetrics() {
 
 	// Number of times to retry before fetching the data before giving up.
@@ -87,38 +123,7 @@ func collectMetrics() {
 	cardinalityInfoByInstance := make(map[string]*cardinality.PrometheusCardinalityInstance)
 
 	if !opts.ServiceDiscovery { // Prometheus instances defined by arguments
-
-		// Captures the instance name and namespace from URLs like http(s)://<instance>.<namespace>...
-		regexC := regexp.MustCompile(`https?://([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)`)
-
-		// In this case the name of the sharded instance is the same as the name of the prometheus instance
-		// This is because it is not possible to distinguish between them based on addresses given as arguments
-		for _, prometheusInstanceAddress := range opts.PrometheusInstances {
-
-			matches := regexC.FindStringSubmatch(prometheusInstanceAddress)
-			if matches == nil {
-				log.Fatalf("%v is not a valid prometheus instance address.", prometheusInstanceAddress)
-			}
-			instanceName := matches[1]
-			namespace := matches[2]
-
-			instanceID := namespace + "_" + instanceName
-
-			// Add the prometheus instance to the data structure
-			cardinalityInfoByInstance[instanceID] = &cardinality.PrometheusCardinalityInstance{
-				Namespace:           namespace,
-				InstanceName:        instanceName,
-				ShardedInstanceName: instanceName,
-				InstanceAddress:     prometheusInstanceAddress,
-				AuthValue:           promAPIAuthValues[prometheusInstanceAddress],
-				TrackedLabels: cardinality.TrackedLabelNames{
-					SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
-					LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
-					MemoryInBytesByLabelNameLabels:    make([]string, 0, opts.StatsLimit),
-					SeriesCountByLabelValuePairLabels: make([]string, 0, opts.StatsLimit),
-				},
-			}
-		}
+		loadManualInstances(cardinalityInfoByInstance, promAPIAuthValues)
 	}
 
 	for {
