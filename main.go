@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -89,27 +88,19 @@ func collectMetrics() {
 
 	if !opts.ServiceDiscovery { // Prometheus instances defined by arguments
 
-		// precompile required regex
-		regexC, err := regexp.Compile(`https?:\/\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+[a-zA-Z0-9_.-]*\/?`)
-		if err != nil {
-			log.Fatalf("invalid regex: %+v", err)
-		}
+		// Captures the instance name and namespace from URLs like http(s)://<instance>.<namespace>...
+		regexC := regexp.MustCompile(`https?://([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)`)
 
 		// In this case the name of the sharded instance is the same as the name of the prometheus instance
-		// This is because is not possible to distinguish between them based on addresses given as arguments
+		// This is because it is not possible to distinguish between them based on addresses given as arguments
 		for _, prometheusInstanceAddress := range opts.PrometheusInstances {
 
-			// Check the address matches a familiar pattern: http(s)://<instance name>.<anything else>(/)
-			matched := regexC.MatchString(prometheusInstanceAddress)
-			if !matched {
+			matches := regexC.FindStringSubmatch(prometheusInstanceAddress)
+			if matches == nil {
 				log.Fatalf("%v is not a valid prometheus instance address.", prometheusInstanceAddress)
 			}
-
-			// Get the name of the prometheus instance from the link
-			splitByDots := strings.Split(prometheusInstanceAddress, ".")
-			splitInstanceName := strings.Split(splitByDots[0], "/")
-			instanceName := splitInstanceName[len(splitInstanceName)-1]
-			namespace := splitByDots[1]
+			instanceName := matches[1]
+			namespace := matches[2]
 
 			instanceID := namespace + "_" + instanceName
 
