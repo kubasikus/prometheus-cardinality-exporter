@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"github/thought-machine/prometheus-cardinality-exporter/cardinality"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -36,7 +39,117 @@ var opts struct {
 	StatsLimit            int      `long:"stats-limit" short:"L" default:"10" help:"Limit the number of items fetched from the TSDB statistics."`
 }
 
-func loadAuthValues(path string) map[string]string {
+// InstanceAuthConfig holds per-instance authentication and connection settings.
+// Supports both the legacy single-header format and the extended format with
+// TLS CA, ServiceAccount auth, custom port, and multiple headers.
+type InstanceAuthConfig struct {
+	Headers       []string `yaml:"headers"`
+	CA            string   `yaml:"ca"`
+	SAAuth        bool     `yaml:"sa_auth"`
+	Port          string   `yaml:"port"`
+	TLSServerName string   `yaml:"tls_server_name"`
+}
+
+// buildHTTPClientForInstance returns an *http.Client appropriate for the given
+// instance config. If no CA is configured, it returns a plain default client.
+// defaultServerName is used for TLS ServerName verification when the config
+// does not specify an explicit tls_server_name override.
+func buildHTTPClientForInstance(config *InstanceAuthConfig, defaultServerName string) *http.Client {
+	if config == nil || config.CA == "" {
+		return &http.Client{}
+	}
+
+	caCert, err := os.ReadFile(config.CA)
+	if err != nil {
+		log.Errorf("Failed to read CA file %s: %v. Falling back to default HTTP client.", config.CA, err)
+		return &http.Client{}
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		log.Errorf("Failed to parse CA certificate from %s. Falling back to default HTTP client.", config.CA)
+		return &http.Client{}
+	}
+
+	serverName := config.TLSServerName
+	if serverName == "" {
+		serverName = defaultServerName
+	}
+
+	tlsConfig := &tls.Config{
+		RootCAs: caCertPool,
+	}
+	if serverName != "" {
+		tlsConfig.ServerName = serverName
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+}
+
+const saTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+// readSAToken reads the pod's default ServiceAccount token from the well-known
+// path and returns it as a formatted "Bearer <token>" string. Returns an empty
+// string if the file cannot be read.
+func readSAToken() string {
+	tokenBytes, err := os.ReadFile(saTokenPath)
+	if err != nil {
+		log.Errorf("Failed to read ServiceAccount token from %s: %v", saTokenPath, err)
+		return ""
+	}
+	return "Bearer " + strings.TrimSpace(string(tokenBytes))
+}
+
+// resolveHeaders returns the effective set of HTTP headers for an instance config.
+// It copies config.Headers and, when sa_auth is enabled, prepends a fresh
+// ServiceAccount bearer token as an Authorization header. This is non-mutating
+// and safe to call every scrape cycle.
+func resolveHeaders(config *InstanceAuthConfig) []string {
+	if config == nil {
+		return nil
+	}
+	headers := make([]string, len(config.Headers))
+	copy(headers, config.Headers)
+
+	if config.SAAuth {
+		token := readSAToken()
+		if token != "" {
+			headers = append([]string{"Authorization: " + token}, headers...)
+		}
+	}
+	return headers
+}
+
+// lookupAuthConfig performs a cascading lookup for the auth config matching
+// the given keys, returning the first match or nil.
+func lookupAuthConfig(authConfigs map[string]*InstanceAuthConfig, keys ...string) *InstanceAuthConfig {
+	for _, key := range keys {
+		if config, ok := authConfigs[key]; ok {
+			return config
+		}
+	}
+	return nil
+}
+
+// loadAuthConfig reads the auth YAML file and returns a map of instance identifiers
+// to their auth/connection configuration. It supports two formats:
+//
+// Legacy (string value):
+//
+//	"identifier": "Bearer eyJ..."
+//
+// Extended (map value):
+//
+//	"identifier":
+//	  headers: ["Authorization: Bearer eyJ..."]
+//	  ca: "/path/to/ca.crt"
+//	  sa_auth: true
+//	  port: "9091"
+func loadAuthConfig(path string) map[string]*InstanceAuthConfig {
 	if path == "" {
 		return nil
 	}
@@ -53,25 +166,51 @@ func loadAuthValues(path string) map[string]string {
 		return nil
 	}
 
-	var values map[string]string
-	if err := yaml.Unmarshal(fileContents, &values); err != nil {
-		log.Errorf("Failed to read Prometheus API authorisation values file into the appropriate data structure: %v. Check the format of your file!", err.Error())
+	var raw map[string]any
+	if err := yaml.Unmarshal(fileContents, &raw); err != nil {
+		log.Errorf("Failed to parse Prometheus API authorisation values file: %v. Check the format of your file!", err.Error())
 		return nil
 	}
 
-	if len(values) == 0 {
+	if len(raw) == 0 {
 		log.Errorf("Skipping the authorisation component to continue collecting metrics from Prometheus instances that don't require authorisation. This will result in no metrics from secured Prometheus instances.")
 		return nil
 	}
 
-	return values
+	configs := make(map[string]*InstanceAuthConfig, len(raw))
+	for key, value := range raw {
+		switch v := value.(type) {
+		case string:
+			// Legacy format: "identifier": "Authorization header value"
+			configs[key] = &InstanceAuthConfig{
+				Headers: []string{"Authorization: " + v},
+			}
+		case map[string]interface{}:
+			// Extended format: re-marshal and unmarshal into InstanceAuthConfig
+			bytes, err := yaml.Marshal(v)
+			if err != nil {
+				log.Errorf("Failed to re-marshal config for key %q: %v", key, err)
+				continue
+			}
+			var cfg InstanceAuthConfig
+			if err := yaml.Unmarshal(bytes, &cfg); err != nil {
+				log.Errorf("Failed to parse extended config for key %q: %v", key, err)
+				continue
+			}
+			configs[key] = &cfg
+		default:
+			log.Errorf("Unexpected value type for key %q in auth config file, skipping.", key)
+		}
+	}
+
+	return configs
 }
 
 // loadManualInstances parses the manually provided Prometheus URLs (--proms) and populates
 // the cardinalityInfoByInstance map with their instance name, namespace, and auth credentials.
 // In this case the name of the sharded instance is the same as the name of the prometheus instance
 // because it is not possible to distinguish between them based on addresses given as arguments.
-func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, promAPIAuthValues map[string]string) {
+func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, authConfigs map[string]*InstanceAuthConfig) {
 	// Captures the instance name and namespace from URLs like http(s)://<instance>.<namespace>...
 	regexC := regexp.MustCompile(`https?://([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)`)
 
@@ -92,7 +231,6 @@ func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.Prome
 			InstanceName:        instanceName,
 			ShardedInstanceName: instanceName,
 			InstanceAddress:     prometheusInstanceAddress,
-			AuthValue:           promAPIAuthValues[prometheusInstanceAddress],
 			TrackedLabels: cardinality.TrackedLabelNames{
 				SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
 				LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
@@ -105,7 +243,8 @@ func loadManualInstances(cardinalityInfoByInstance map[string]*cardinality.Prome
 
 // discoverInstances uses Kubernetes service discovery to find Prometheus endpoints
 // matching the configured selector and regex, and populates the cardinalityInfoByInstance map.
-func discoverInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, promAPIAuthValues map[string]string) {
+// Port and scheme are resolved from the auth config when available.
+func discoverInstances(cardinalityInfoByInstance map[string]*cardinality.PrometheusCardinalityInstance, authConfigs map[string]*InstanceAuthConfig) {
 	// Obtains the cluster config of the cluster we are currently in
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -154,13 +293,33 @@ func discoverInstances(cardinalityInfoByInstance map[string]*cardinality.Prometh
 					shardedInstanceName := address.TargetRef.Name // Name of sharded instance e.g. prometheus-kubernetes-0
 					instanceID := namespace + "_" + prometheusInstanceName + "_" + shardedInstanceName
 
+					// Cascading auth config lookup: sharded instance -> instance -> namespace
+					authCfg := lookupAuthConfig(authConfigs,
+						instanceID,
+						namespace+"_"+prometheusInstanceName,
+						namespace,
+					)
+
+					// Resolve port and scheme from auth config
+					port := "9090"
+					scheme := "http"
+					if authCfg != nil {
+						if authCfg.Port != "" {
+							port = authCfg.Port
+						}
+						if authCfg.CA != "" {
+							scheme = "https"
+						}
+					}
+					instanceAddress := fmt.Sprintf("%s://%s:%s", scheme, address.IP, port)
+
 					if _, ok := cardinalityInfoByInstance[instanceID]; !ok {
 						// Add a newly found endpoint to the data structure
 						cardinalityInfoByInstance[instanceID] = &cardinality.PrometheusCardinalityInstance{
 							Namespace:           namespace,
 							InstanceName:        prometheusInstanceName,
 							ShardedInstanceName: shardedInstanceName,
-							InstanceAddress:     "http://" + address.IP + ":9090",
+							InstanceAddress:     instanceAddress,
 							TrackedLabels: cardinality.TrackedLabelNames{
 								SeriesCountByMetricNameLabels:     make([]string, 0, opts.StatsLimit),
 								LabelValueCountByLabelNameLabels:  make([]string, 0, opts.StatsLimit),
@@ -169,16 +328,8 @@ func discoverInstances(cardinalityInfoByInstance map[string]*cardinality.Prometh
 							},
 						}
 					} else {
-						// If the endpoint is already known, update it's address
-						cardinalityInfoByInstance[instanceID].InstanceAddress = "http://" + address.IP + ":9090"
-					}
-
-					if authValue, ok := promAPIAuthValues[instanceID]; ok { // Check for Prometheus API credentials for sharded instance
-						cardinalityInfoByInstance[instanceID].AuthValue = authValue
-					} else if authValue, ok := promAPIAuthValues[namespace+"_"+prometheusInstanceName]; ok { // Check for Prometheus API credentials for instance
-						cardinalityInfoByInstance[instanceID].AuthValue = authValue
-					} else if authValue, ok := promAPIAuthValues[namespace]; ok { // Check for Prometheus API credentials for namespace
-						cardinalityInfoByInstance[instanceID].AuthValue = authValue
+						// If the endpoint is already known, update its address
+						cardinalityInfoByInstance[instanceID].InstanceAddress = instanceAddress
 					}
 				}
 			}
@@ -196,8 +347,8 @@ func collectMetrics() {
 		log.Errorf("Cannot parse frequency variable %v: %v", opts.Frequency, err)
 	}
 
-	// Map of prometheus instance identifiers to their authorisation credentials, used for accessing the TSDB API
-	promAPIAuthValues := loadAuthValues(opts.PromAPIAuthValuesFile)
+	// Map of prometheus instance identifiers to their auth/connection configuration
+	authConfigs := loadAuthConfig(opts.PromAPIAuthValuesFile)
 
 	// This is a data structure that allows for the storage of the names prometheus instances and their sharded instances
 	// Sharded instances are specified because a service may have several endpoints
@@ -206,23 +357,34 @@ func collectMetrics() {
 	cardinalityInfoByInstance := make(map[string]*cardinality.PrometheusCardinalityInstance)
 
 	if !opts.ServiceDiscovery { // Prometheus instances defined by arguments
-		loadManualInstances(cardinalityInfoByInstance, promAPIAuthValues)
+		loadManualInstances(cardinalityInfoByInstance, authConfigs)
 	}
 
 	for {
 		if opts.ServiceDiscovery {
-			discoverInstances(cardinalityInfoByInstance, promAPIAuthValues)
+			discoverInstances(cardinalityInfoByInstance, authConfigs)
 		}
 
 		// Iterates over all prometheus instances and runs cardinality exporter logic
 		for instanceID, instance := range cardinalityInfoByInstance {
 
-			prometheusClient := &http.Client{}
+			// Cascading auth config lookup: sharded instance -> instance -> namespace -> full URL
+			authCfg := lookupAuthConfig(authConfigs,
+				instanceID,
+				instance.Namespace+"_"+instance.InstanceName,
+				instance.Namespace,
+				instance.InstanceAddress,
+			)
+
+			// Resolve headers each cycle so SA tokens are always fresh
+			instance.Headers = resolveHeaders(authCfg)
+			serviceDNS := instance.InstanceName + "." + instance.Namespace + ".svc"
+			prometheusClient := buildHTTPClientForInstance(authCfg, serviceDNS)
 
 			log.Infof("Fetching current Prometheus status, from Prometheus instance: %v. Sharded instance: %v. Namespace: %v.", instance.InstanceName, instance.ShardedInstanceName, instance.Namespace)
 
-			if instance.AuthValue != "" {
-				log.Info("Including Authorization header.")
+			if len(instance.Headers) > 0 {
+				log.Info("Including custom headers.")
 			}
 
 			// Fetch the data from Prometheus
@@ -263,7 +425,7 @@ func main() {
 	if len(opts.PrometheusInstances) > 0 && opts.ServiceDiscovery {
 		log.Fatal("Cannot parse Prometheus Instances (--proms) AND use Service Discovery (--service_discovery), these options are mutually exclusive.")
 	} else if len(opts.PrometheusInstances) > 0 {
-		log.Info("Obtaining metics from prometheus instances specified as arguments.")
+		log.Info("Obtaining metrics from prometheus instances specified as arguments.")
 	} else if opts.ServiceDiscovery {
 		log.Info("Obtaining metrics from services found with service discovery.")
 	} else {

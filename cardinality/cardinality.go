@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -69,6 +70,7 @@ type PrometheusCardinalityInstance struct {
 	InstanceAddress     string
 	ShardedInstanceName string
 	AuthValue           string
+	Headers             []string
 	LatestTSDBStatus    TSDBStatus
 	TrackedLabels       TrackedLabelNames
 }
@@ -84,13 +86,19 @@ func (promInstance *PrometheusCardinalityInstance) FetchTSDBStatus(prometheusCli
 	apiURL := promInstance.InstanceAddress + "/api/v1/status/tsdb?" + queryParams
 
 	request, err := http.NewRequest("GET", apiURL, nil)
-
-	if promInstance.AuthValue != "" {
-		request.Header.Add("Authorization", promInstance.AuthValue)
-	}
-
 	if err != nil {
 		return fmt.Errorf("cannot create GET request to %v: %v", apiURL, err)
+	}
+
+	if len(promInstance.Headers) > 0 {
+		for _, header := range promInstance.Headers {
+			parts := strings.SplitN(header, ": ", 2)
+			if len(parts) == 2 {
+				request.Header.Add(parts[0], parts[1])
+			}
+		}
+	} else if promInstance.AuthValue != "" {
+		request.Header.Add("Authorization", promInstance.AuthValue)
 	}
 
 	// Perform GET request
