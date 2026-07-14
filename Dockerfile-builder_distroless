@@ -1,11 +1,9 @@
-# 1.25.5-alpine3.23 (linux/amd64)
-FROM golang:1.25.6-alpine3.23@sha256:d9b2e14101f27ec8d09674cd01186798d227bb0daec90e032aeb1cd22ac0f029 AS builder
-
-RUN ln -s /usr/local/go/bin/go /usr/local/bin/go
+# 1.26.2-alpine3.23 (linux/amd64)
+FROM golang:1.26.4-alpine3.23@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS builder
 
 RUN apk add --no-cache curl wget gcc make bash git musl-dev libc6-compat gettext
 
-WORKDIR /go/github.com/thought-machine/prometheus-cardinality-exporter
+WORKDIR /app
 
 COPY . .
 
@@ -15,13 +13,13 @@ RUN go test ./... -race
 
 # So the binary is where we expect it
 # env var and flags ensure a static binary
-RUN CGO_ENABLED=0 go build -ldflags="-extldflags=-static" .
+RUN CGO_ENABLED=0 go build -ldflags="-extldflags=-static" -o prometheus-cardinality-exporter .
 
 FROM scratch
 
 EXPOSE 9090
 
-COPY --from=builder /go/github.com/thought-machine/prometheus-cardinality-exporter/prometheus-cardinality-exporter /home/app/prometheus-cardinality-exporter
+COPY --from=builder /app/prometheus-cardinality-exporter /home/app/prometheus-cardinality-exporter
 
 USER 255999
 
